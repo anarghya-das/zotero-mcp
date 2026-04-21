@@ -665,6 +665,29 @@ def advanced_search(
         return f"Error in advanced search: {str(e)}"
 
 
+_COLLECTION_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
+
+
+def _resolve_collection_arg(collection: str, ctx: Context) -> str | None:
+    """Turn a `collection` argument into a Zotero collection key.
+
+    Treats an 8-char uppercase alphanumeric input as a key directly;
+    anything else is resolved as a (case-insensitive) collection name
+    via the same helper the CLI uses. Returns None on resolution error
+    after logging to ctx.
+    """
+    if _COLLECTION_KEY_RE.match(collection):
+        return collection
+    try:
+        from zotero_mcp.client import get_zotero_client
+        zot = get_zotero_client()
+        resolved = _helpers._resolve_collection_names(zot, [collection], ctx=ctx)
+        return resolved[0] if resolved else None
+    except Exception as e:
+        ctx.warning(f"Could not resolve collection '{collection}': {e}")
+        return None
+
+
 @mcp.tool(
     name="zotero_semantic_search",
     description="Prioritized search tool. Perform semantic search over your Zotero library using AI-powered embeddings. BEST TOOL for finding papers on a specific topic — much more efficient than scanning collection items or reading abstracts. Works across your entire library."
@@ -673,6 +696,7 @@ def semantic_search(
     query: str,
     limit: int = 10,
     filters: dict[str, str] | str | None = None,
+    collection: str | None = None,
     *,
     ctx: Context
 ) -> str:
@@ -683,6 +707,10 @@ def semantic_search(
         query: Search query text - can be concepts, topics, or natural language descriptions
         limit: Maximum number of results to return (default: 10)
         filters: Optional metadata filters as dict or JSON string. Example: {"item_type": "note"}
+        collection: Restrict results to items indexed with this Zotero
+            subcollection (8-char key like "ABC12345" or a collection name).
+            Only items indexed with ``update-db --collection KEY`` will match;
+            legacy records without a stamped collection_key are filtered out.
         ctx: MCP context
 
     Returns:
@@ -714,6 +742,16 @@ def semantic_search(
             # Additional field name translations can be added here
             # Example: if "creatorType" in filters:
             #     filters["creator_type"] = filters.pop("creatorType")
+
+        # Merge subcollection scope into filters so Chroma's `where` clause
+        # hard-restricts results.
+        if collection:
+            collection_key = _resolve_collection_arg(collection, ctx)
+            if collection_key:
+                if filters is None:
+                    filters = {}
+                filters["collection_key"] = collection_key
+                ctx.info(f"Scoping semantic search to collection {collection_key}")
 
         ctx.info(f"Performing semantic search for: '{query}'")
 

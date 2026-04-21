@@ -514,20 +514,44 @@ class LocalZoteroReader:
         )
         return cursor.fetchone()[0]
 
-    def get_items_with_text(self, limit: int | None = None, include_fulltext: bool = False, key_filter: str | None = None) -> list[ZoteroItem]:
+    def get_items_with_text(
+        self,
+        limit: int | None = None,
+        include_fulltext: bool = False,
+        key_filter: str | None = None,
+        collection_key: str | None = None,
+    ) -> list[ZoteroItem]:
         """
         Get all items with their text content for semantic search.
 
         Args:
             limit: Optional limit on number of items to return.
+            include_fulltext: Extract fulltext for each item on the fly.
+            key_filter: Restrict to a single Zotero item key.
+            collection_key: Restrict to items directly in this Zotero
+                collection (no recursive descent into subcollections).
 
         Returns:
             List of ZoteroItem objects with text content.
         """
         conn = self._get_connection()
 
-        # Query to get items with their text content (simplified for now)
-        query = """
+        # Collection filter is injected conditionally so the unscoped query
+        # plan is byte-identical to pre-change callers. The existing
+        # GROUP BY i.itemID prevents row fan-out when an item is in several
+        # collections.
+        collection_joins = ""
+        collection_where = ""
+        if collection_key:
+            collection_joins = (
+                "\n        LEFT JOIN collectionItems ci_scope "
+                "ON ci_scope.itemID = i.itemID"
+                "\n        LEFT JOIN collections col_scope "
+                "ON col_scope.collectionID = ci_scope.collectionID"
+            )
+            collection_where = " AND col_scope.key = ?"
+
+        query = f"""
         SELECT
             i.itemID,
             i.key,
@@ -575,12 +599,16 @@ class LocalZoteroReader:
         -- Get creators
         LEFT JOIN itemCreators ic ON i.itemID = ic.itemID
         LEFT JOIN creators c ON ic.creatorID = c.creatorID
+        {collection_joins}
 
         WHERE it.typeName NOT IN ('attachment', 'note', 'annotation')
         AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
+        {collection_where}
         """
 
-        params = []
+        params: list = []
+        if collection_key:
+            params.append(collection_key)
         if key_filter:
             query += " AND i.key = ?"
             params.append(key_filter)

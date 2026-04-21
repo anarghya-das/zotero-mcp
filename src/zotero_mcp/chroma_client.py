@@ -559,6 +559,20 @@ class ChromaClient:
             logger.error(f"Error deleting documents from ChromaDB: {e}")
             raise
 
+    def delete_documents_where(self, where: dict[str, Any]) -> None:
+        """Delete documents matching a metadata filter.
+
+        Needed for chunked indexing: one paper produces many documents
+        (one per passage), so purging stale state requires a metadata
+        filter, not a concrete ID list.
+        """
+        try:
+            self.collection.delete(where=where)
+            logger.info(f"Deleted documents matching {where} from ChromaDB collection")
+        except Exception as e:
+            logger.error(f"Error deleting documents matching {where}: {e}")
+            raise
+
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
         try:

@@ -11,20 +11,42 @@ if sys.version_info >= (3, 14):
 from zotero_mcp import semantic_search
 
 
+class _FakeCollection:
+    """Pre-seeded with item_key=ITEMA001 so had-prior detection returns True."""
+
+    def __init__(self, seed_keys=("ITEMA001",)):
+        self._seed = set(seed_keys)
+
+    def get(self, where=None, ids=None, limit=None, include=None):
+        if where and "item_key" in where:
+            k = where["item_key"]
+            if k in self._seed:
+                return {"ids": [f"{k}#-1"], "metadatas": [{"item_key": k}]}
+            return {"ids": [], "metadatas": []}
+        return {"ids": [], "metadatas": []}
+
+    def delete(self, where=None, ids=None):
+        if where and "item_key" in where:
+            self._seed.discard(where["item_key"])
+
+
 class FakeChromaClient:
-    def __init__(self):
+    def __init__(self, seed_keys=("ITEMA001",)):
         self.upserted_ids = []
         self.embedding_max_tokens = 8000
-
-    def get_existing_ids(self, ids):
-        # Pretend item A already exists and item B is new.
-        return {"ITEMA001"} & set(ids)
+        self.collection = _FakeCollection(seed_keys=seed_keys)
 
     def upsert_documents(self, documents, metadatas, ids):
         self.upserted_ids.extend(ids)
+        for doc_id in ids:
+            key = doc_id.split("#", 1)[0]
+            self.collection._seed.add(key)
 
     def truncate_text(self, text, max_tokens=None):
         return text
+
+    def delete_documents_where(self, where):
+        self.collection.delete(where=where)
 
 
 def test_process_item_batch_tracks_added_vs_updated(monkeypatch):
@@ -96,15 +118,19 @@ def test_process_item_batch_defers_failures_when_failed_docs_provided(monkeypatc
     failed_docs = []
     stats = search._process_item_batch(items, force_rebuild=False, _failed_docs=failed_docs)
 
-    # All 3 items prepared successfully (text built, truncated, queued)
+    # All 3 items prepared successfully (text built, truncated, queued).
+    # With chunking each item emits exactly one summary chunk (no fulltext),
+    # so the 3 items → 3 deferred docs with IDs like "ITEM000#-1".
     assert stats["processed"] == 3
-    # All 3 items deferred to the retry list when the upsert raised
     assert len(failed_docs) == 3
-    assert {doc_id for _, _, doc_id in failed_docs} == {"ITEM000", "ITEM001", "ITEM002"}
-    # Errors bumped by the deferred count so the totals stay accurate
+    assert {doc_id for _, _, doc_id in failed_docs} == {
+        "ITEM000#-1", "ITEM001#-1", "ITEM002#-1",
+    }
+    # Errors count the chunk-level docs deferred for retry.
     assert stats["errors"] == 3
-    # No items classified as added/updated because the batch never reached
-    # the existing-id lookup
+    # added/updated are NOT bumped on batch failure — the retry path at
+    # update_database increments recovered_items instead. This prevents
+    # double-counting once retry succeeds.
     assert stats["added"] == 0
     assert stats["updated"] == 0
 

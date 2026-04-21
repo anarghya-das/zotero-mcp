@@ -200,6 +200,147 @@ def get_item_fulltext(
 
 
 @mcp.tool(
+    name="zotero_get_item_passages",
+    description=(
+        "Get passages from a single Zotero item's indexed fulltext. "
+        "Much lighter than zotero_get_item_fulltext (10K+ tokens). "
+        "Best after zotero_semantic_search surfaces a candidate paper and "
+        "you need specific evidence paragraphs for synthesis/citation. "
+        "Pass a query to rank passages by relevance; omit query to read the "
+        "paper linearly (summary first, then chunks in order)."
+    )
+)
+def get_item_passages(
+    item_key: str,
+    query: str | None = None,
+    limit: int = 10,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Return chunked passages from a single paper in the semantic index.
+
+    Args:
+        item_key: The 8-char Zotero item key.
+        query: Optional query string. When set, returns top-``limit`` chunks
+            ranked by semantic relevance. When None, returns up to ``limit``
+            chunks in natural order (summary first, then fulltext chunks by
+            index).
+        limit: Maximum passages to return.
+        ctx: MCP context.
+
+    Returns:
+        Markdown-formatted passages with similarity scores (when ranking).
+    """
+    try:
+        if not item_key:
+            return "Error: item_key is required"
+
+        try:
+            from zotero_mcp.semantic_search import create_semantic_search
+        except ImportError:
+            return (
+                "Semantic search is not available. Install the required packages with:\n"
+                "  pip install zotero-mcp-server[semantic]"
+            )
+
+        config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+        search = create_semantic_search(str(config_path))
+        client = search.chroma_client
+
+        # Gather passages for the paper.
+        passages: list[dict] = []
+
+        if query:
+            ctx.info(f"Ranking passages of {item_key} against query: {query!r}")
+            results = client.search(
+                query_texts=[query],
+                n_results=limit,
+                where={"item_key": item_key},
+            )
+            ids = (results.get("ids") or [[]])[0]
+            documents = (results.get("documents") or [[]])[0]
+            distances = (results.get("distances") or [[]])[0]
+            metadatas = (results.get("metadatas") or [[]])[0]
+            for i, doc_id in enumerate(ids):
+                meta = metadatas[i] if i < len(metadatas) else {}
+                passages.append({
+                    "id": doc_id,
+                    "text": documents[i] if i < len(documents) else "",
+                    "chunk_idx": int(meta.get("chunk_idx"))
+                        if meta.get("chunk_idx") is not None
+                        else None,
+                    "similarity_score": 1 - (distances[i] if i < len(distances) else 0),
+                    "metadata": meta,
+                })
+        else:
+            ctx.info(f"Listing passages for {item_key} in chunk order")
+            got = client.collection.get(
+                where={"item_key": item_key},
+                include=["documents", "metadatas"],
+            )
+            ids = got.get("ids") or []
+            documents = got.get("documents") or []
+            metadatas = got.get("metadatas") or []
+            for i, doc_id in enumerate(ids):
+                meta = metadatas[i] if i < len(metadatas) else {}
+                passages.append({
+                    "id": doc_id,
+                    "text": documents[i] if i < len(documents) else "",
+                    "chunk_idx": int(meta.get("chunk_idx"))
+                        if meta.get("chunk_idx") is not None
+                        else None,
+                    "similarity_score": None,
+                    "metadata": meta,
+                })
+            # Natural order: summary (-1) first, then chunks 0..N; None last.
+            passages.sort(
+                key=lambda p: (
+                    p["chunk_idx"] is None,
+                    p["chunk_idx"] if p["chunk_idx"] is not None else 0,
+                )
+            )
+            passages = passages[:limit]
+
+        if not passages:
+            return (
+                f"No passages found for item `{item_key}` in the semantic index.\n\n"
+                "If this paper is in your Zotero library, it may not be indexed yet. "
+                "Run `zotero-mcp update-db --fulltext` (or scope to a subcollection "
+                "with `--collection <KEY>`). For the raw paper text, use "
+                "`zotero_get_item_fulltext`."
+            )
+
+        # Render.
+        title = passages[0]["metadata"].get("title") if passages[0]["metadata"] else ""
+        header = f"# Passages from `{item_key}`"
+        if title:
+            header += f" — {title}"
+        lines: list[str] = [header, ""]
+        if query:
+            lines.append(f"*Ranked by relevance to: `{query}`*")
+            lines.append("")
+
+        for p in passages:
+            if p["chunk_idx"] == -1:
+                heading = "### Summary"
+            else:
+                idx = p["chunk_idx"] if p["chunk_idx"] is not None else "?"
+                heading = f"### Passage {idx}"
+            if p["similarity_score"] is not None:
+                heading += f"  (score: {p['similarity_score']:.3f})"
+            lines.append(heading)
+            lines.append(p["text"])
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        ctx.error(f"Error fetching item passages: {str(e)}")
+        return f"Error fetching item passages: {str(e)}"
+
+
+@mcp.tool(
     name="zotero_get_collections",
     description="List all collections in your Zotero library."
 )

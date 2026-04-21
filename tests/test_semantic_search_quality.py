@@ -26,14 +26,50 @@ from zotero_mcp import semantic_search
 # Helpers
 # ---------------------------------------------------------------------------
 
+class _FakeCollection:
+    """Minimal Chroma collection stand-in for the chunked pipeline."""
+
+    def __init__(self):
+        self.data: dict[str, tuple[str, dict]] = {}
+
+    def get(self, where=None, ids=None, limit=None, include=None):
+        if where:
+            hits = [
+                (k, v) for k, v in self.data.items()
+                if all(v[1].get(wk) == wv for wk, wv in where.items())
+            ]
+            if limit:
+                hits = hits[:limit]
+            return {
+                "ids": [k for k, _ in hits],
+                "metadatas": [v[1] for _, v in hits],
+                "documents": [v[0] for _, v in hits],
+            }
+        return {"ids": [], "metadatas": [], "documents": []}
+
+    def delete(self, where=None, ids=None):
+        if where:
+            victims = [
+                k for k, v in self.data.items()
+                if all(v[1].get(wk) == wv for wk, wv in where.items())
+            ]
+            for k in victims:
+                del self.data[k]
+        if ids:
+            for i in ids:
+                self.data.pop(i, None)
+
+
 class FakeChromaClient:
     """Minimal ChromaClient stub for unit tests."""
 
     def __init__(self):
         self.upserted_docs = []
         self.upserted_ids = []
+        self.upserted_metadatas = []
         self.embedding_max_tokens = 8000
         self._last_query_kwargs = None
+        self.collection = _FakeCollection()
 
     def get_existing_ids(self, ids):
         return set()
@@ -41,10 +77,16 @@ class FakeChromaClient:
     def upsert_documents(self, documents, metadatas, ids):
         self.upserted_docs.extend(documents)
         self.upserted_ids.extend(ids)
+        self.upserted_metadatas.extend(metadatas)
+        for doc, meta, doc_id in zip(documents, metadatas, ids):
+            self.collection.data[doc_id] = (doc, meta)
 
     def truncate_text(self, text, max_tokens=None):
         # Pass-through for tests (no actual truncation)
         return text
+
+    def delete_documents_where(self, where):
+        self.collection.delete(where=where)
 
     def search(self, query_texts=None, n_results=10, where=None, where_document=None):
         self._last_query_kwargs = {
@@ -84,15 +126,26 @@ class TestCombineStructuredAndFulltext:
             return semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
 
     def test_fulltext_prepended_with_structured_fields(self):
+        """With chunking: structured fields live in the summary chunk (#-1);
+        fulltext lives in chunks (#0, #1, …). Both are searchable."""
         search = self._make_search()
         item = _make_item("K1", title="My Title", abstract="My Abstract", fulltext="Full paper text here.")
         stats = search._process_item_batch([item], force_rebuild=True)
 
         assert stats["processed"] == 1
-        doc = search.chroma_client.upserted_docs[0]
-        # Structured fields should appear before fulltext
-        assert doc.index("My Title") < doc.index("Full paper text here.")
-        assert doc.index("My Abstract") < doc.index("Full paper text here.")
+        docs_by_id = dict(zip(search.chroma_client.upserted_ids, search.chroma_client.upserted_docs))
+
+        summary = docs_by_id["K1#-1"]
+        assert "My Title" in summary
+        assert "My Abstract" in summary
+        assert "Full paper text here." not in summary
+
+        fulltext_chunks = [
+            docs_by_id[i] for i in docs_by_id
+            if i.startswith("K1#") and not i.endswith("#-1")
+        ]
+        assert fulltext_chunks
+        assert any("Full paper text here." in c for c in fulltext_chunks)
 
     def test_no_fulltext_uses_structured_only(self):
         search = self._make_search()
@@ -105,13 +158,27 @@ class TestCombineStructuredAndFulltext:
         assert "Just abstract" in doc
 
     def test_empty_structured_with_fulltext(self):
+        """Minimal metadata: fulltext content is preserved in a fulltext chunk.
+
+        The summary chunk (#-1) always exists as long as _create_document_text
+        returns something (format_creators returns "No authors listed" for
+        empty creator lists, which keeps the summary non-empty). What matters
+        for retrieval is that the fulltext itself ends up in a fulltext chunk.
+        """
         search = self._make_search()
         item = _make_item("K3", title="", abstract="", fulltext="Only fulltext content.")
         stats = search._process_item_batch([item], force_rebuild=True)
 
         assert stats["processed"] == 1
-        doc = search.chroma_client.upserted_docs[0]
-        assert "Only fulltext content." in doc
+        docs_by_id = dict(zip(search.chroma_client.upserted_ids, search.chroma_client.upserted_docs))
+
+        # Fulltext lives in a fulltext chunk (#0, #1, …), not the summary.
+        fulltext_chunks = {i: d for i, d in docs_by_id.items() if not i.endswith("#-1")}
+        assert fulltext_chunks
+        assert any("Only fulltext content." in d for d in fulltext_chunks.values())
+        assert not any(
+            "Only fulltext content." in d for i, d in docs_by_id.items() if i.endswith("#-1")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -571,10 +638,16 @@ class TestReranking:
         }
         return s
 
-    def test_reranker_disabled_by_default(self):
+    def test_reranker_enabled_by_default(self):
+        """Reranker is now ON by default for chunked retrieval quality.
+
+        We assert via the config dict, not _get_reranker() — that would
+        eagerly instantiate the CrossEncoder (heavy sentence-transformers
+        model download) inside unit tests.
+        """
         with patch.object(semantic_search, "get_zotero_client", return_value=object()):
             s = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
-        assert s._get_reranker() is None
+        assert s._reranker_config.get("enabled") is True
 
     def test_reranker_reorders_results(self):
         s = self._make_search_with_reranker(enabled=True)
@@ -598,17 +671,18 @@ class TestReranking:
     def test_search_overfetches_when_reranker_enabled(self):
         s = self._make_search_with_reranker(enabled=True)
         s._reranker = MagicMock()
-        s._reranker.rerank.return_value = [0, 1]
+        s._reranker.rerank.return_value = list(range(8))
 
         s.zotero_client = MagicMock()
         s.zotero_client.item.return_value = {"data": {"title": "mock"}}
 
         s.search("test", limit=2)
 
-        # candidate_multiplier=3, so n_results should be 2*3=6
-        assert s.chroma_client._last_query_kwargs["n_results"] == 6
+        # group_multiplier=4 × limit=2 = 8; reranker multiplier=3 × limit=2 = 6;
+        # fetch uses the larger so grouping has room.
+        assert s.chroma_client._last_query_kwargs["n_results"] == 8
 
-    def test_search_without_reranker_uses_original_limit(self):
+    def test_search_overfetches_for_grouping_without_reranker(self):
         s = self._make_search_with_reranker(enabled=False)
 
         s.zotero_client = MagicMock()
@@ -616,4 +690,6 @@ class TestReranking:
 
         s.search("test", limit=5)
 
-        assert s.chroma_client._last_query_kwargs["n_results"] == 5
+        # With chunking, each paper has multiple Chroma docs — need headroom
+        # for _enrich_search_results's grouping to still yield `limit` papers.
+        assert s.chroma_client._last_query_kwargs["n_results"] == 20

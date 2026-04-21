@@ -210,6 +210,10 @@ def main():
                                  help="Path to semantic search configuration file")
     update_db_parser.add_argument("--db-path",
                                  help="Path to Zotero database file (zotero.sqlite), overrides config")
+    update_db_parser.add_argument("--collection",
+                                 help="Restrict indexing to items directly in this Zotero collection (8-char key).")
+    update_db_parser.add_argument("--collection-name",
+                                 help="Restrict indexing to items in the named collection (case-insensitive).")
 
     # Database status command
     db_status_parser = subparsers.add_parser("db-status", help="Show semantic search database status")
@@ -386,6 +390,41 @@ def main():
             # Save the db_path to config file for future use
             _save_zotero_db_path_to_config(config_path, db_path)
 
+        # Resolve subcollection scope. --collection and --collection-name are
+        # mutually exclusive to avoid ambiguity when the two disagree.
+        collection_key = getattr(args, "collection", None)
+        collection_name = getattr(args, "collection_name", None)
+        if collection_key and collection_name:
+            print(
+                "Error: --collection and --collection-name are mutually exclusive.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        if collection_key or collection_name:
+            from zotero_mcp.client import get_zotero_client
+            from zotero_mcp.tools._helpers import _resolve_collection_names
+            zot = get_zotero_client()
+            if collection_name and not collection_key:
+                resolved = _resolve_collection_names(zot, [collection_name])
+                if not resolved:
+                    print(
+                        f"Error: no collection matched '{collection_name}'.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                collection_key = resolved[0]
+            if collection_key and not collection_name:
+                # Best-effort display name for progress + metadata stamping.
+                try:
+                    collection_name = zot.collection(collection_key)["data"]["name"]
+                except Exception:
+                    collection_name = None
+            print(
+                f"Scoping to collection '{collection_name or collection_key}' "
+                f"(key={collection_key})"
+            )
+
         try:
             # Create semantic search instance with optional db_path override
             search = create_semantic_search(str(config_path), db_path=db_path)
@@ -405,7 +444,9 @@ def main():
             stats = search.update_database(
                 force_full_rebuild=args.force_rebuild,
                 limit=args.limit,
-                extract_fulltext=args.fulltext
+                extract_fulltext=args.fulltext,
+                collection_key=collection_key,
+                collection_name=collection_name,
             )
 
             print(f"\nDatabase update completed:")
@@ -553,6 +594,10 @@ def main():
                     if needle not in (title or "").lower() and needle not in (creators or "").lower():
                         continue
                 print(f"- {title} | {creators}")
+                scope_key = meta.get("collection_key")
+                scope_name = meta.get("collection_name")
+                if scope_key:
+                    print(f"  collection: {scope_name or ''} ({scope_key})")
                 if args.show_documents:
                     doc = (data.get("documents", [""])[i] or "").strip()
                     snippet = doc[:200].replace("\n", " ") + ("..." if len(doc) > 200 else "")
