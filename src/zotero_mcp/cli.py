@@ -219,6 +219,9 @@ def main():
     db_status_parser = subparsers.add_parser("db-status", help="Show semantic search database status")
     db_status_parser.add_argument("--config-path",
                                  help="Path to semantic search configuration file")
+    db_status_parser.add_argument("--by-collection", action="store_true",
+                                 help="Show per-collection breakdown of unique papers and chunks "
+                                      "(same data as the zotero_semantic_db_status MCP tool).")
 
     # DB inspect command (sample and filter indexed docs; also supports stats)
     inspect_parser = subparsers.add_parser("db-inspect", help="Inspect indexed documents or show aggregate stats for the semantic DB")
@@ -482,6 +485,19 @@ def main():
         try:
             # Create semantic search instance
             search = create_semantic_search(str(config_path))
+
+            # --by-collection routes through the same introspection the MCP
+            # tool uses, showing unique-paper counts instead of raw doc count.
+            if getattr(args, "by_collection", False):
+                from zotero_mcp.tools.search import semantic_db_status
+
+                class _Ctx:
+                    def info(self, *a, **k): pass
+                    def warning(self, *a, **k): pass
+                    def error(self, *a, **k): pass
+
+                print(semantic_db_status(ctx=_Ctx()))
+                sys.exit(0)
 
             # Get database status
             status = search.get_database_status()

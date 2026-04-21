@@ -960,3 +960,156 @@ def get_search_database_status(*, ctx: Context) -> str:
     except Exception as e:
         ctx.error(f"Error getting database status: {str(e)}")
         return f"Error getting database status: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_semantic_db_status",
+    description=(
+        "Introspect the semantic search index and report what's actually "
+        "indexed. Shows a per-collection breakdown of UNIQUE PAPERS (not raw "
+        "chunk docs, which are misleading under chunked indexing), plus the "
+        "embedding model, chunked-schema marker, auto-update state, and "
+        "chunks-per-paper stats. Use this to confirm which subcollections are "
+        "currently embedded before running a semantic search."
+    )
+)
+def semantic_db_status(*, ctx: Context) -> str:
+    """Summarize the semantic DB: unique papers + chunks per collection."""
+    try:
+        ctx.info("Introspecting semantic search index...")
+
+        try:
+            from zotero_mcp.semantic_search import create_semantic_search
+        except ImportError:
+            return (
+                "Semantic search is not available. Install the required packages with:\n"
+                "  pip install zotero-mcp-server[semantic]"
+            )
+
+        config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+        search = create_semantic_search(str(config_path))
+        client = search.chroma_client
+        col = client.collection
+
+        metas = (col.get(include=["metadatas"]).get("metadatas") or [])
+        total_chunks = len(metas)
+
+        # Bucket by collection_key; None -> "(unscoped)"
+        from collections import defaultdict
+        buckets: dict[str, dict] = defaultdict(
+            lambda: {"papers": set(), "chunks": 0, "name": None}
+        )
+        for m in metas:
+            m = m or {}
+            key = m.get("collection_key") or "(unscoped)"
+            b = buckets[key]
+            b["chunks"] += 1
+            ik = m.get("item_key")
+            if ik:
+                b["papers"].add(ik)
+            if not b["name"] and m.get("collection_name"):
+                b["name"] = m["collection_name"]
+
+        total_papers = {m.get("item_key") for m in metas if m and m.get("item_key")}
+        total_papers.discard(None)
+
+        # Chunks-per-paper stats
+        per_paper_counts: list[int] = []
+        paper_chunks: dict[str, int] = defaultdict(int)
+        for m in metas:
+            ik = (m or {}).get("item_key")
+            if ik:
+                paper_chunks[ik] += 1
+        per_paper_counts = list(paper_chunks.values())
+
+        # Header
+        lines: list[str] = ["# Semantic DB Status", ""]
+
+        # Backend metadata
+        ef_name = type(client.embedding_function).__name__
+        model_name = getattr(client.embedding_function, "model_name", None)
+        lines.append(f"**Embedding:** `{search.chroma_client.embedding_model}`"
+                     + (f" (`{model_name}`)" if model_name else f" (`{ef_name}`)"))
+        lines.append(f"**Persist directory:** `{client.persist_directory}`")
+
+        # Chunked marker
+        marker = getattr(col, "metadata", None) or {}
+        if marker.get("chunked") is True:
+            lines.append(f"**Schema:** chunked (v{marker.get('chunk_version', '?')}) ✓")
+        elif total_chunks > 0:
+            lines.append(
+                "**Schema:** ⚠ LEGACY (unchunked) — run "
+                "`zotero-mcp update-db --force-rebuild` to upgrade to chunked retrieval"
+            )
+        else:
+            lines.append("**Schema:** (empty index)")
+
+        # Auto-update state
+        uc = search.update_config or {}
+        if uc.get("auto_update"):
+            lines.append(
+                f"**Auto-update:** enabled (frequency: `{uc.get('update_frequency', 'manual')}`)"
+            )
+        else:
+            lines.append("**Auto-update:** disabled — runs only on explicit `update-db` CLI calls")
+        if uc.get("last_update"):
+            lines.append(f"**Last update:** {uc['last_update']}")
+
+        lines.append("")
+
+        # Per-collection table
+        if total_chunks == 0:
+            lines.append("## Coverage")
+            lines.append("")
+            lines.append("**Index is empty** — 0 papers indexed.")
+            lines.append("")
+            lines.append(
+                "To index a Zotero subcollection:\n"
+                "`zotero-mcp update-db --collection <KEY> --fulltext`"
+            )
+            return "\n".join(lines)
+
+        lines.append("## Coverage by collection")
+        lines.append("")
+        lines.append("| Collection | Key | Papers | Chunks |")
+        lines.append("|---|---|---:|---:|")
+
+        # Sort: scoped collections first (by paper count desc), unscoped bucket last
+        scoped = [(k, b) for k, b in buckets.items() if k != "(unscoped)"]
+        scoped.sort(key=lambda kv: -len(kv[1]["papers"]))
+        ordered = scoped + [(k, b) for k, b in buckets.items() if k == "(unscoped)"]
+
+        for key, b in ordered:
+            name = b["name"] or ("(unscoped legacy records)" if key == "(unscoped)" else "?")
+            key_label = "—" if key == "(unscoped)" else f"`{key}`"
+            lines.append(f"| {name} | {key_label} | {len(b['papers'])} | {b['chunks']} |")
+
+        lines.append(f"| **TOTAL** |  | **{len(total_papers)}** | **{total_chunks}** |")
+        lines.append("")
+
+        # Chunks-per-paper stats
+        if per_paper_counts:
+            counts_sorted = sorted(per_paper_counts)
+            n = len(counts_sorted)
+            median = counts_sorted[n // 2]
+            mean = sum(counts_sorted) / n
+            lines.append(
+                f"**Chunks per paper:** min {min(counts_sorted)}, "
+                f"median {median}, max {max(counts_sorted)}, avg {mean:.1f}"
+            )
+            lines.append("")
+
+        # Unscoped warning if applicable
+        if "(unscoped)" in buckets and buckets["(unscoped)"]["papers"]:
+            lines.append(
+                "> ⚠ Unscoped records have no `collection_key` metadata and will NOT "
+                "match `zotero_semantic_search(collection=...)` queries. They usually "
+                "come from unscoped `update-db` runs or auto-update overwriting scoped "
+                "stamps. Re-run `update-db --collection <KEY>` to restore the stamp."
+            )
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        ctx.error(f"Error reading semantic DB status: {str(e)}")
+        return f"Error reading semantic DB status: {str(e)}"
