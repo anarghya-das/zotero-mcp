@@ -358,7 +358,9 @@ class TestCollectionItemsEdgeCases:
         from zotero_mcp.tools.retrieval import get_collection_items
 
         result = get_collection_items(collection_key="COL1", detail="summary", limit=1, ctx=dummy_ctx)
-        assert "Showing 1 of 2 items" in result
+        # Range-based footer: "Showing items 0..0 of 2. For the next page, ... offset=1 ..."
+        assert "Showing items" in result and "of 2" in result
+        assert "offset=1" in result  # next-page hint points at remaining item
 
 
 class TestBatchChildrenEdgeCases:

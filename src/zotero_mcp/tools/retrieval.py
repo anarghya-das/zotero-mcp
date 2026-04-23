@@ -455,6 +455,7 @@ def get_collection_items(
     collection_key: str,
     detail: Literal["keys_only", "summary", "full"] = "summary",
     limit: int | str | None = 50,
+    offset: int | str | None = 0,
     *,
     ctx: Context
 ) -> str:
@@ -463,7 +464,10 @@ def get_collection_items(
 
     Args:
         collection_key: The collection key/ID
-        limit: Maximum number of items to return
+        limit: Maximum number of items to return on this page
+        offset: Starting index into the filtered parent-items list. Use with
+            `limit` to page through collections that exceed the per-detail
+            ceiling. The response footer reports the range and next offset.
         ctx: MCP context
 
     Returns:
@@ -480,7 +484,18 @@ def get_collection_items(
         except Exception:
             collection_name = f"Collection {collection_key}"
 
-        limit = _helpers._normalize_limit(limit, default=50)
+        # Ceiling scales with detail. Sized for a 1M-context consumer (~20% of
+        # context at ceiling), so even a 500-paper review collection can be
+        # listed in a single call at full detail.
+        #   keys_only: ~10 tokens/item  → 10000 ≈ 100k tokens
+        #   summary:   ~200 tokens/item → 1000  ≈ 200k tokens
+        #   full:      ~500 tokens/item → 300   ≈ 150k tokens
+        _max_limit = (
+            10000 if detail == "keys_only"
+            else 1000 if detail == "summary"
+            else 300
+        )
+        limit = _helpers._normalize_limit(limit, default=50, max_val=_max_limit)
 
         # Fetch all items (includes children mixed in with parents)
         all_items = _helpers._paginate(zot.collection_items, collection_key)
@@ -516,16 +531,20 @@ def get_collection_items(
         if not parent_items:
             return f"No items found in collection: {collection_name} (Key: {collection_key})"
 
-        # Apply display limit after filtering
-        if limit and len(parent_items) > limit:
-            display_items = parent_items[:limit]
-            truncated = True
-        else:
-            display_items = parent_items
-            truncated = False
+        # Parse offset (accept int or numeric string; negative → 0).
+        try:
+            offset_i = max(0, int(offset) if offset is not None else 0)
+        except (TypeError, ValueError):
+            offset_i = 0
+
+        # Apply offset + limit window to the filtered parent list.
+        total_parents = len(parent_items)
+        window_end = offset_i + limit
+        display_items = parent_items[offset_i:window_end]
+        truncated = window_end < total_parents or offset_i > 0
 
         # Format items as markdown based on detail level
-        output = [f"# Items in Collection: {collection_name} ({len(parent_items)} items)", ""]
+        output = [f"# Items in Collection: {collection_name} ({total_parents} items)", ""]
 
         for i, item in enumerate(display_items, 1):
             key = item.get("key", "")
@@ -558,7 +577,20 @@ def get_collection_items(
                 ))
 
         if truncated:
-            output.append(f"\n*Showing {limit} of {len(parent_items)} items. Increase the limit parameter to see more.*")
+            shown = len(display_items)
+            last_shown = offset_i + shown - 1 if shown else offset_i
+            parts = [
+                f"*Showing items {offset_i}..{last_shown} of {total_parents}."
+            ]
+            next_offset = offset_i + shown
+            if next_offset < total_parents:
+                parts.append(
+                    f" For the next page, re-call with offset={next_offset} "
+                    f"(limit unchanged)."
+                )
+            else:
+                parts.append(" (end of collection)")
+            output.append("\n" + "".join(parts) + "*")
 
         result = "\n".join(output)
         if detail == "full":
