@@ -745,6 +745,7 @@ def semantic_search(
 
         # Merge subcollection scope into filters so Chroma's `where` clause
         # hard-restricts results.
+        collection_key: str | None = None
         if collection:
             collection_key = _resolve_collection_arg(collection, ctx)
             if collection_key:
@@ -771,6 +772,32 @@ def semantic_search(
         # Create semantic search instance
         search = create_semantic_search(str(config_path))
 
+        # If the user scoped to a collection, probe Chroma first so we can
+        # distinguish "scope not indexed" from "scope indexed but no match".
+        # The former is actionable — we tell the model to ask the user whether
+        # to index first or fall back to the Zotero API.
+        if collection_key and not search.chroma_client.has_documents_where(
+            {"collection_key": collection_key}
+        ):
+            return (
+                f"# Collection `{collection_key}` is not in the semantic search database\n\n"
+                f"No passages have been indexed for this collection, so semantic search "
+                f"cannot return results for it.\n\n"
+                f"**Two options — ask the user which to proceed with:**\n\n"
+                f"**A. Index the collection first (recommended for semantic search).** "
+                f"In a terminal, run:\n\n"
+                f"```bash\n"
+                f"zotero-mcp update-db --collection {collection_key} --fulltext\n"
+                f"```\n\n"
+                f"Then retry this query. Fulltext extraction may take several minutes "
+                f"depending on PDF count.\n\n"
+                f"**B. Browse the collection via the Zotero API (no semantic ranking).** "
+                f"Call the `zotero_get_collection_items` tool with "
+                f"`collection_key=\"{collection_key}\"` and filter the results by title "
+                f"and abstract. Results will be in Zotero's natural order, not ranked by "
+                f"relevance to the query.\n"
+            )
+
         # Perform search
         results = search.search(query=query, limit=limit, filters=filters)
 
@@ -782,17 +809,72 @@ def semantic_search(
         if not search_results:
             return f"No semantically similar items found for query: '{query}'"
 
+        # Classify each result so the model can tell the user whether the
+        # hit came from fulltext or only from the title+abstract summary.
+        def _best_chunk_idx(res: dict) -> int | None:
+            meta = res.get("metadata") or {}
+            if "chunk_idx" in meta:
+                try:
+                    return int(meta["chunk_idx"])
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        def _has_fulltext_indexed(res: dict) -> bool:
+            for p in res.get("passages") or []:
+                try:
+                    if int(p.get("chunk_idx", -1)) >= 0:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            return False
+
+        summary_only_count = sum(
+            1 for r in search_results
+            if not _has_fulltext_indexed(r)
+        )
+
         # Format results as markdown
         output = [f"# Semantic Search Results for '{query}'", ""]
         output.append(f"Found {len(search_results)} similar items:")
+        if summary_only_count:
+            output.append("")
+            output.append(
+                f"> ⚠ {summary_only_count} of {len(search_results)} results are indexed "
+                f"on title + abstract only (no PDF fulltext). For deeper retrieval, "
+                f"re-index with `update-db --collection <KEY> --fulltext`."
+            )
         output.append("")
 
         for i, result in enumerate(search_results, 1):
             similarity_score = result.get("similarity_score", 0)
             zotero_item = result.get("zotero_item", {})
+            best_idx = _best_chunk_idx(result)
+            fulltext_indexed = _has_fulltext_indexed(result)
+
+            if best_idx is not None and best_idx >= 0:
+                match_label = f"fulltext passage #{best_idx}"
+            elif best_idx == -1 and fulltext_indexed:
+                # Summary outscored fulltext — tell the model it can drill deeper.
+                match_label = (
+                    "summary (title + abstract) — fulltext *is* indexed for "
+                    "this paper; use `zotero_get_item_passages` to pull "
+                    "passages ranked for a sub-query"
+                )
+            elif best_idx == -1:
+                match_label = (
+                    "summary only (title + abstract) — no PDF fulltext "
+                    "indexed; run `update-db --fulltext` to enable "
+                    "passage-level retrieval"
+                )
+            else:
+                match_label = "unknown"
 
             if zotero_item:
-                extra = {"Similarity Score": f"{similarity_score:.3f}"}
+                extra = {
+                    "Similarity Score": f"{similarity_score:.3f}",
+                    "Match Type": match_label,
+                }
                 matched_text = result.get("matched_text", "")
                 if matched_text:
                     snippet = matched_text[:300] + "..." if len(matched_text) > 300 else matched_text
@@ -804,6 +886,7 @@ def semantic_search(
                 # Fallback if full Zotero item not available
                 output.append(f"## {i}. Item {result.get('item_key', 'Unknown')}")
                 output.append(f"**Similarity Score:** {similarity_score:.3f}")
+                output.append(f"**Match Type:** {match_label}")
                 if error := result.get("error"):
                     output.append(f"**Error:** {error}")
                 output.append("")
@@ -995,9 +1078,11 @@ def semantic_db_status(*, ctx: Context) -> str:
         total_chunks = len(metas)
 
         # Bucket by collection_key; None -> "(unscoped)"
+        # `fulltext_papers`: set of item_keys that have at least one
+        # chunk_idx >= 0 (i.e., actual fulltext passages, not just summary).
         from collections import defaultdict
         buckets: dict[str, dict] = defaultdict(
-            lambda: {"papers": set(), "chunks": 0, "name": None}
+            lambda: {"papers": set(), "chunks": 0, "name": None, "fulltext_papers": set()}
         )
         for m in metas:
             m = m or {}
@@ -1007,6 +1092,11 @@ def semantic_db_status(*, ctx: Context) -> str:
             ik = m.get("item_key")
             if ik:
                 b["papers"].add(ik)
+                try:
+                    if int(m.get("chunk_idx", -1)) >= 0:
+                        b["fulltext_papers"].add(ik)
+                except (TypeError, ValueError):
+                    pass
             if not b["name"] and m.get("collection_name"):
                 b["name"] = m["collection_name"]
 
@@ -1071,20 +1161,35 @@ def semantic_db_status(*, ctx: Context) -> str:
 
         lines.append("## Coverage by collection")
         lines.append("")
-        lines.append("| Collection | Key | Papers | Chunks |")
-        lines.append("|---|---|---:|---:|")
+        lines.append("| Collection | Key | Papers | Fulltext | Chunks |")
+        lines.append("|---|---|---:|---:|---:|")
 
         # Sort: scoped collections first (by paper count desc), unscoped bucket last
         scoped = [(k, b) for k, b in buckets.items() if k != "(unscoped)"]
         scoped.sort(key=lambda kv: -len(kv[1]["papers"]))
         ordered = scoped + [(k, b) for k, b in buckets.items() if k == "(unscoped)"]
 
+        total_fulltext = 0
         for key, b in ordered:
             name = b["name"] or ("(unscoped legacy records)" if key == "(unscoped)" else "?")
             key_label = "—" if key == "(unscoped)" else f"`{key}`"
-            lines.append(f"| {name} | {key_label} | {len(b['papers'])} | {b['chunks']} |")
+            ft = len(b["fulltext_papers"])
+            total_fulltext += ft
+            papers = len(b["papers"])
+            ft_cell = f"{ft}/{papers}"
+            lines.append(f"| {name} | {key_label} | {papers} | {ft_cell} | {b['chunks']} |")
 
-        lines.append(f"| **TOTAL** |  | **{len(total_papers)}** | **{total_chunks}** |")
+        lines.append(
+            f"| **TOTAL** |  | **{len(total_papers)}** | "
+            f"**{total_fulltext}/{len(total_papers)}** | **{total_chunks}** |"
+        )
+        lines.append("")
+        lines.append(
+            "> `Fulltext` = papers with at least one indexed PDF passage. "
+            "Papers listed as `0/N` are indexed on title + abstract only — "
+            "re-run `update-db --collection <KEY> --fulltext` to enable "
+            "passage-level retrieval for them."
+        )
         lines.append("")
 
         # Chunks-per-paper stats

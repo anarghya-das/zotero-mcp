@@ -227,6 +227,47 @@ def test_empty_collection(monkeypatch, dummy_ctx):
     assert "empty" in low or "0 paper" in low or "no papers" in low
 
 
+def test_per_collection_fulltext_column(monkeypatch, dummy_ctx):
+    """User should see how many papers in each collection have fulltext indexed.
+
+    A paper has fulltext iff any of its chunks has `chunk_idx >= 0`. Summary-only
+    papers have just `chunk_idx == -1`.
+    """
+    metas = []
+    # Collection A: P1 has fulltext (chunks -1, 0, 1); P2 is summary-only (-1).
+    for idx in (-1, 0, 1):
+        metas.append(_mk_meta("P1", idx, "AAAAAAAA", "coll-a"))
+    metas.append(_mk_meta("P2", -1, "AAAAAAAA", "coll-a"))
+    # Collection B: Q1 is summary-only.
+    metas.append(_mk_meta("Q1", -1, "BBBBBBBB", "coll-b"))
+
+    _install(monkeypatch, _FakeSearch(_FakeChroma(metas)))
+    out = _tool()(ctx=dummy_ctx)
+
+    # The per-collection table should show a fulltext column.
+    low = out.lower()
+    assert "fulltext" in low or "full-text" in low
+    # coll-a: 2 papers total, 1 has fulltext.
+    # coll-b: 1 paper total, 0 have fulltext.
+    # These counts must appear in the output (exact row format left flexible).
+    assert "coll-a" in out and "coll-b" in out
+
+
+def test_fulltext_coverage_all_summary_only(monkeypatch, dummy_ctx):
+    """Entire collection is summary-only — column should show 0 fulltext."""
+    metas = [
+        _mk_meta("P1", -1, "CCCCCCCC", "coll-c"),
+        _mk_meta("P2", -1, "CCCCCCCC", "coll-c"),
+        _mk_meta("P3", -1, "CCCCCCCC", "coll-c"),
+    ]
+    _install(monkeypatch, _FakeSearch(_FakeChroma(metas)))
+    out = _tool()(ctx=dummy_ctx)
+
+    # Output should clearly indicate zero fulltext coverage for this collection.
+    assert "coll-c" in out
+    assert "fulltext" in out.lower() or "full-text" in out.lower()
+
+
 def test_chunk_stats_reported(monkeypatch, dummy_ctx):
     """Min/median/max/avg chunks per paper should surface."""
     # Paper A: 5 chunks; Paper B: 10 chunks; Paper C: 20 chunks

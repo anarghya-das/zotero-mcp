@@ -81,6 +81,23 @@ def test_delete_documents_where_no_match_is_noop(tmp_path):
     assert client.collection.count() == 4
 
 
+def test_has_documents_where_true_when_match_exists(tmp_path):
+    client = _client(tmp_path, name="test_has_docs_true")
+    _seed(client)
+    assert client.has_documents_where({"group": "a"}) is True
+
+
+def test_has_documents_where_false_when_no_match(tmp_path):
+    client = _client(tmp_path, name="test_has_docs_false")
+    _seed(client)
+    assert client.has_documents_where({"group": "nonexistent"}) is False
+
+
+def test_has_documents_where_on_empty_collection(tmp_path):
+    client = _client(tmp_path, name="test_has_docs_empty")
+    assert client.has_documents_where({"group": "a"}) is False
+
+
 def test_delete_documents_where_raises_on_backend_error(tmp_path, monkeypatch):
     """Backend errors should propagate, matching delete_documents behavior."""
     client = _client(tmp_path, name="test_delete_err")

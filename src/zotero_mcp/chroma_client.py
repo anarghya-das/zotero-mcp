@@ -338,7 +338,8 @@ class ChromaClient:
 
             # Get or create collection with the configured embedding function.
             # If the user switched embedding models, the persisted collection
-            # will have stale config.  Detect the mismatch and drop/recreate.
+            # will have stale config.  Detect the mismatch and drop/recreate —
+            # but only if no data is at stake. See _auto_drop_allowed.
             try:
                 self.collection = self.client.get_or_create_collection(
                     name=self.collection_name,
@@ -346,7 +347,8 @@ class ChromaClient:
                 )
 
                 # ChromaDB may silently persist the old embedding function config.
-                # Check if the stored config matches what we want; if not, recreate.
+                # Check if the stored config matches what we want; if not, decide
+                # whether it's safe to recreate or refuse.
                 stored_config = getattr(self.collection, 'metadata', {}) or {}
                 if not stored_config:
                     # Try reading config from the collection's config_json_str
@@ -361,23 +363,45 @@ class ChromaClient:
                             # Compare stored model with configured model
                             configured_model = getattr(self.embedding_function, 'model_name', None)
                             if stored_model and configured_model and stored_model != configured_model:
+                                existing = self.collection.count()
+                                if not self._auto_drop_allowed(existing):
+                                    self._raise_auto_drop_refused(
+                                        reason=(
+                                            f"Stored embedding model '{stored_model}' differs "
+                                            f"from configured '{configured_model}'."
+                                        ),
+                                        existing_count=existing,
+                                    )
                                 logger.warning(
                                     f"Stored embedding model '{stored_model}' differs from "
-                                    f"configured '{configured_model}'. Resetting collection."
+                                    f"configured '{configured_model}'. Resetting empty collection."
                                 )
                                 self.client.delete_collection(name=self.collection_name)
                                 self.collection = self.client.create_collection(
                                     name=self.collection_name,
                                     embedding_function=self.embedding_function
                                 )
+                    except RuntimeError:
+                        raise  # Our own refusal — propagate.
                     except Exception:
                         pass  # Best-effort check; proceed with existing collection
 
             except Exception as e:
                 if "embedding function conflict" in str(e).lower():
+                    # Probe the existing collection's count without triggering
+                    # the EF validation again (read-only sysdb path).
+                    existing = self._peek_existing_count()
+                    if not self._auto_drop_allowed(existing):
+                        self._raise_auto_drop_refused(
+                            reason=(
+                                f"ChromaDB raised an embedding-function conflict on "
+                                f"collection '{self.collection_name}'."
+                            ),
+                            existing_count=existing,
+                        )
                     logger.warning(
                         f"Embedding model changed to '{self.embedding_model}'. "
-                        "Resetting collection for rebuild."
+                        "Auto-resetting empty collection."
                     )
                     self.client.delete_collection(name=self.collection_name)
                     self.collection = self.client.create_collection(
@@ -386,6 +410,72 @@ class ChromaClient:
                     )
                 else:
                     raise
+
+    def _auto_drop_allowed(self, existing_count: int) -> bool:
+        """Whether the auto-drop-on-EF-conflict path may proceed.
+
+        Only safe on empty collections — a non-empty collection represents
+        real indexed data the user paid embedding-API dollars to compute.
+        ZOTERO_MCP_ALLOW_AUTO_RESET=1 overrides for CI / intentional rebuilds.
+        """
+        if os.environ.get("ZOTERO_MCP_ALLOW_AUTO_RESET") == "1":
+            return True
+        return existing_count <= 0
+
+    def _raise_auto_drop_refused(self, reason: str, existing_count: int) -> None:
+        """Refuse to silently destroy a populated collection.
+
+        Happened once (2026-04-23): a diagnostic CLI call triggered the
+        previous auto-wipe path and destroyed a 1,652-chunk index. This
+        guard makes the failure loud and actionable.
+        """
+        raise RuntimeError(
+            f"Refusing to auto-drop collection '{self.collection_name}' "
+            f"({existing_count} documents indexed).\n\n"
+            f"Reason: {reason}\n\n"
+            f"To rebuild intentionally:\n"
+            f"  1. Back up '{self.persist_directory}' first.\n"
+            f"  2. Then run `zotero-mcp update-db --force-rebuild` (or remove "
+            f"the directory and re-run `update-db --collection <KEY> --fulltext`).\n\n"
+            f"Set ZOTERO_MCP_ALLOW_AUTO_RESET=1 to bypass this guard "
+            f"(not recommended — your embeddings will be destroyed)."
+        )
+
+    def _peek_existing_count(self) -> int:
+        """Read a collection's doc count without triggering EF validation.
+
+        Tries in order:
+          1. `client.get_collection(name)` — works in most Chroma versions.
+          2. Raw SQLite count via `chroma.sqlite3` — fallback when the
+             client rejects read access due to EF drift.
+        """
+        try:
+            existing = self.client.get_collection(name=self.collection_name)
+            return existing.count()
+        except Exception:
+            pass
+        try:
+            import sqlite3
+            db_path = Path(self.persist_directory) / "chroma.sqlite3"
+            if not db_path.exists():
+                return 0
+            con = sqlite3.connect(str(db_path))
+            try:
+                cur = con.execute(
+                    """
+                    SELECT COUNT(*) FROM embeddings e
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = ?
+                    """,
+                    (self.collection_name,),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                con.close()
+        except Exception:
+            return 0
 
     def _create_embedding_function(self) -> EmbeddingFunction:
         """Create the appropriate embedding function based on configuration."""
@@ -572,6 +662,19 @@ class ChromaClient:
         except Exception as e:
             logger.error(f"Error deleting documents matching {where}: {e}")
             raise
+
+    def has_documents_where(self, where: dict[str, Any]) -> bool:
+        """Return True iff at least one document matches the metadata filter.
+
+        Used to distinguish "scope indexed but no matches for query" from
+        "scope not indexed at all" — the two cases warrant different UX.
+        """
+        try:
+            result = self.collection.get(where=where, limit=1, include=[])
+            return bool(result.get("ids"))
+        except Exception as e:
+            logger.error(f"Error probing documents matching {where}: {e}")
+            return False
 
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
