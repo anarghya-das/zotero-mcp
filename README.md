@@ -29,7 +29,10 @@
 
 ### 🧠 AI-Powered Semantic Search
 - **Vector-based similarity search** over your entire research library (requires `[semantic]` extra)
+- **Subcollection scoping** — embed and search a single Zotero collection instead of the whole library (great for literature reviews)
+- **Chunked passage retrieval** — papers are split into overlapping passages so search surfaces the relevant *section* of a paper, not just the paper
 - **Multiple embedding models**: Default (free, local), OpenAI, and Gemini
+- **Cross-encoder reranking** enabled by default for better top-k quality
 - **Intelligent results** with similarity scores and contextual matching
 - **Auto-updating database** with configurable sync schedules
 
@@ -173,7 +176,33 @@ zotero-mcp update-db --force-rebuild
 
 # Check database status
 zotero-mcp db-status
+
+# Per-collection breakdown (papers and chunks indexed per subcollection)
+zotero-mcp db-status --by-collection
 ```
+
+### Scoped Indexing (Subcollections)
+
+Instead of embedding your entire library, scope indexing to a single Zotero collection. Useful for literature-review workflows where you only want retrieval to cover a curated set of papers.
+
+```bash
+# Index only the "ai-icu-review" collection (direct items, not nested subcollections)
+zotero-mcp update-db --collection-name "ai-icu-review" --fulltext
+
+# Or pass the 8-character collection key directly
+zotero-mcp update-db --collection 8ZRMEM98 --fulltext
+
+# Scoped force-rebuild purges only that collection's records — other scopes are untouched
+zotero-mcp update-db --collection 8ZRMEM98 --fulltext --force-rebuild
+```
+
+In your AI assistant, pass the same `collection` argument to `zotero_semantic_search` to limit results to that scope:
+
+> *"Search the ai-icu-review collection for papers on sepsis early-warning systems"*
+
+### Chunked Passage Retrieval
+
+Long PDFs are split into overlapping passages (sized automatically to your embedding model's context window). `zotero_semantic_search` returns the best-matching passage for each paper, and `zotero_get_item_passages` pulls all passages for a specific paper — optionally filtered by a query — for focused LLM synthesis.
 
 **Example Semantic Queries in your AI assistant:**
 - *"Find research similar to machine learning concepts in neuroscience"*
@@ -317,7 +346,10 @@ zotero-mcp update-db --fulltext             # Update with full-text extraction (
 zotero-mcp update-db --force-rebuild       # Force complete database rebuild
 zotero-mcp update-db --fulltext --force-rebuild  # Rebuild with full-text extraction
 zotero-mcp update-db --fulltext --db-path "your_path_to/zotero.sqlite" # Customize your zotero database path
+zotero-mcp update-db --collection KEY --fulltext       # Index only a specific subcollection (by 8-char key)
+zotero-mcp update-db --collection-name NAME --fulltext # Index only a specific subcollection (by name)
 zotero-mcp db-status                       # Show database status and info
+zotero-mcp db-status --by-collection       # Per-collection breakdown (papers and chunks indexed)
 
 # General
 zotero-mcp version                         # Show current version
@@ -340,7 +372,9 @@ The first time you use PDF annotation features, the necessary tools will be auto
 ## 📚 Available Tools
 
 ### 🧠 Semantic Search Tools
-- `zotero_semantic_search`: AI-powered similarity search with embedding models
+- `zotero_semantic_search`: AI-powered similarity search with embedding models; pass `collection` to scope results to one subcollection
+- `zotero_get_item_passages`: Retrieve chunked passages for a single paper — all passages in order, or top-k by query
+- `zotero_semantic_db_status`: Per-collection breakdown of indexed papers and chunks, embedding model, chunked-schema marker, and auto-update state
 - `zotero_update_search_database`: Manually update the semantic search database
 - `zotero_get_search_database_status`: Check database status and configuration
 

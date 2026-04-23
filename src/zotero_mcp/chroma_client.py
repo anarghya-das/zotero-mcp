@@ -619,13 +619,16 @@ class ChromaClient:
         Get metadata for a document if it exists.
 
         Args:
-            doc_id: Document ID to look up
+            doc_id: Bare Zotero item key (resolved to the `key#-1` summary
+                chunk under the chunked schema), or a full chunk ID like
+                `key#N` for direct lookup.
 
         Returns:
             Metadata dictionary if document exists, None otherwise
         """
+        lookup_id = doc_id if "#" in doc_id else f"{doc_id}#-1"
         try:
-            result = self.collection.get(ids=[doc_id], include=["metadatas"])
+            result = self.collection.get(ids=[lookup_id], include=["metadatas"])
             if result['ids'] and result['metadatas']:
                 return result['metadatas'][0]
             return None
